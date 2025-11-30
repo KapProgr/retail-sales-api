@@ -21,10 +21,10 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 app = FastAPI(title="Retail Sales ML API")
 
-# CORS middleware για να δουλεύει με React frontend
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Για production βάλε το domain σου
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,6 +82,25 @@ class MLPredictor:
         df = df.dropna()
         
         return df
+    
+    def prepare_data(self, df):
+        """Prepare data for training"""
+        feature_cols = [col for col in df.columns if col not in ['date', 'sales']]
+        self.feature_names = feature_cols
+        
+        X = df[feature_cols]
+        y = df['sales']
+        
+        # Split chronologically
+        split_idx = int(len(df) * 0.8)
+        X_train, X_test = X[:split_idx], X[split_idx:]
+        y_train, y_test = y[:split_idx], y[split_idx:]
+        
+        # Scale
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        return X_train_scaled, X_test_scaled, y_train, y_test, df.iloc[split_idx:]['date']
     
     def train_and_predict(self, df):
         """Train models and make predictions"""
@@ -153,32 +172,116 @@ class MLPredictor:
         best_model = self.models[best_model_name]
         if hasattr(best_model, 'feature_importances_'):
             importances = best_model.feature_importances_
+            max_importance = max(importances) if max(importances) > 0 else 1
             feature_importance = [
-                {'feature': feat, 'importance': float(imp)}
+                {
+                    'feature': feat, 
+                    'importance': float(imp / max_importance * 100)
+                }
                 for feat, imp in zip(self.feature_names, importances)
             ]
             feature_importance = sorted(feature_importance, key=lambda x: x['importance'], reverse=True)[:10]
         else:
-            feature_importance = [
-                {'feature': feat, 'importance': 50.0}
-                for feat in self.feature_names[:5]
-            ]
+            # For Linear Regression, use coefficient magnitudes
+            if hasattr(best_model, 'coef_'):
+                coefs = np.abs(best_model.coef_)
+                max_coef = max(coefs) if max(coefs) > 0 else 1
+                feature_importance = [
+                    {
+                        'feature': feat,
+                        'importance': float(abs(coef) / max_coef * 100)
+                    }
+                    for feat, coef in zip(self.feature_names, coefs)
+                ]
+                feature_importance = sorted(feature_importance, key=lambda x: x['importance'], reverse=True)[:10]
+            else:
+                feature_importance = []
         
-        # Future predictions
+        # Future predictions with proper feature updates
         last_date = df['date'].max()
         if isinstance(last_date, str):
             last_date = pd.to_datetime(last_date)
         
         future_predictions = []
-        last_row = df_featured.iloc[-1:][feature_cols].copy()
+        recent_sales = df['sales'].tail(30).values.tolist()
         
         for i in range(1, 31):
             future_date = last_date + timedelta(days=i)
             
-            # Simple future prediction (using last known features)
-            X_future = last_row.values
+            # Time features for this future date
+            day_of_week = future_date.weekday()
+            month = future_date.month
+            day_of_month = future_date.day
+            week_of_year = future_date.isocalendar().week
+            is_weekend = 1 if day_of_week >= 5 else 0
+            quarter = (month - 1) // 3 + 1
+            day_of_year = future_date.timetuple().tm_yday
+            
+            # Cyclical features
+            day_of_week_sin = np.sin(2 * np.pi * day_of_week / 7)
+            day_of_week_cos = np.cos(2 * np.pi * day_of_week / 7)
+            month_sin = np.sin(2 * np.pi * month / 12)
+            month_cos = np.cos(2 * np.pi * month / 12)
+            
+            # Holiday detection
+            is_holiday = 0
+            if month == 12 and day_of_month > 15:
+                is_holiday = 1
+            elif month == 11 and day_of_month > 20:
+                is_holiday = 1
+            
+            # Lag features
+            sales_lag_1 = recent_sales[-1] if len(recent_sales) >= 1 else df['sales'].mean()
+            sales_lag_7 = recent_sales[-7] if len(recent_sales) >= 7 else df['sales'].mean()
+            sales_lag_14 = recent_sales[-14] if len(recent_sales) >= 14 else df['sales'].mean()
+            sales_lag_30 = recent_sales[-30] if len(recent_sales) >= 30 else df['sales'].mean()
+            
+            # Rolling features
+            sales_rolling_mean_7 = np.mean(recent_sales[-7:]) if len(recent_sales) >= 7 else df['sales'].mean()
+            sales_rolling_std_7 = np.std(recent_sales[-7:]) if len(recent_sales) >= 7 else df['sales'].std()
+            sales_rolling_mean_14 = np.mean(recent_sales[-14:]) if len(recent_sales) >= 14 else df['sales'].mean()
+            sales_rolling_std_14 = np.std(recent_sales[-14:]) if len(recent_sales) >= 14 else df['sales'].std()
+            sales_rolling_mean_30 = np.mean(recent_sales[-30:]) if len(recent_sales) >= 30 else df['sales'].mean()
+            sales_rolling_std_30 = np.std(recent_sales[-30:]) if len(recent_sales) >= 30 else df['sales'].std()
+            
+            # Build feature dict
+            feature_dict = {
+                'day_of_week': day_of_week,
+                'month': month,
+                'day_of_month': day_of_month,
+                'week_of_year': week_of_year,
+                'is_weekend': is_weekend,
+                'is_holiday': is_holiday,
+                'quarter': quarter,
+                'day_of_year': day_of_year,
+                'day_of_week_sin': day_of_week_sin,
+                'day_of_week_cos': day_of_week_cos,
+                'month_sin': month_sin,
+                'month_cos': month_cos,
+                'sales_lag_1': sales_lag_1,
+                'sales_lag_7': sales_lag_7,
+                'sales_lag_14': sales_lag_14,
+                'sales_lag_30': sales_lag_30,
+                'sales_rolling_mean_7': sales_rolling_mean_7,
+                'sales_rolling_std_7': sales_rolling_std_7,
+                'sales_rolling_mean_14': sales_rolling_mean_14,
+                'sales_rolling_std_14': sales_rolling_std_14,
+                'sales_rolling_mean_30': sales_rolling_mean_30,
+                'sales_rolling_std_30': sales_rolling_std_30
+            }
+            
+            # Create feature array in correct order
+            X_future = np.array([[feature_dict.get(feat, 0) for feat in feature_cols]])
             X_future_scaled = self.scaler.transform(X_future)
+            
+            # Predict
             pred = best_model.predict(X_future_scaled)[0]
+            pred = max(pred, 0)
+            
+            # Update recent sales
+            recent_sales.append(pred)
+            if len(recent_sales) > 30:
+                recent_sales = recent_sales[-30:]
             
             future_predictions.append({
                 'date': future_date.strftime('%Y-%m-%d'),
@@ -193,7 +296,7 @@ class MLPredictor:
             'feature_importance': feature_importance
         }
 
-# Global predictor instance
+# Global predictor
 predictor = MLPredictor()
 
 @app.get("/")
@@ -242,19 +345,15 @@ async def get_sample_data():
 async def upload_file(file: UploadFile = File(...)):
     """Upload CSV file and get predictions"""
     try:
-        # Read CSV
         contents = await file.read()
         df = pd.read_csv(io.StringIO(contents.decode('utf-8')))
         
-        # Validate columns
         if 'date' not in df.columns or 'sales' not in df.columns:
             raise HTTPException(status_code=400, detail="CSV must have 'date' and 'sales' columns")
         
-        # Convert types
         df['date'] = pd.to_datetime(df['date'])
         df['sales'] = df['sales'].astype(float)
         
-        # Train and predict
         results = predictor.train_and_predict(df)
         
         return results
@@ -266,13 +365,11 @@ async def upload_file(file: UploadFile = File(...)):
 async def predict(data: List[SalesData]):
     """Send JSON data and get predictions"""
     try:
-        # Convert to DataFrame
         df = pd.DataFrame([{'date': item.date, 'sales': item.sales} for item in data])
         
         if len(df) < 100:
             raise HTTPException(status_code=400, detail="Need at least 100 data points")
         
-        # Train and predict
         results = predictor.train_and_predict(df)
         
         return results
